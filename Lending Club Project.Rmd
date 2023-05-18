@@ -1,0 +1,729 @@
+---
+title: "Lending Club Loan History Challenge"
+author: "Aaron Banlao"
+output:
+  pdf_document: default
+  html_notebook: default
+  html_document:
+    df_print: paged
+---
+
+```{r}
+library(pacman)
+p_load(ggplot2, dplyr, tidyverse, janitor, GGally, tidymodels, yardstick, kknn, ranger, klaR, discrim, xgboost, C50, rpart, partykit, ROSE, caret)
+```
+
+
+# Building the Model
+
+## Reading in the data
+
+```{r}
+lend <- read.csv("lending_club_data_2012_2014_small.csv")
+head(lend)
+```
+
+```{r}
+dim(lend)
+```
+
+```{r}
+colnames(lend)
+```
+
+
+## Retrieving duplicates in the dataset
+```{r}
+get_dupes(lend)
+```
+
+
+## Finding the number and percentage of nulls in columns
+```{r}
+apply(lend, 2, function(x)sum(is.na(x)))
+```
+
+
+```{r}
+apply(lend, 2, function(x)sum(is.na(x))/length(x))
+```
+
+## Selecting columns with less than 50% missing values
+```{r}
+lend <- lend[,which(colMeans(!is.na(lend)) > 0.5)]
+```
+
+```{r}
+apply(lend, 2, function(x)sum(is.na(x))/length(x))
+```
+
+## Selcting relevant predictor variables 
+```{r}
+lend <- lend %>% 
+  dplyr::select(annual_inc, loan_amnt, verification_status, fico_range_high, grade, total_acc, loan_status, inq_last_6mths, emp_length, home_ownership, purpose, int_rate, tot_cur_bal)
+
+head(lend)
+```
+```{r}
+lend <- lend %>% 
+  drop_na()
+```
+
+
+## Exploring the levels of the categorical Variables
+
+```{r}
+lend %>% 
+  distinct(verification_status)
+```
+
+```{r}
+lend %>% 
+  distinct(grade)
+```
+
+```{r}
+lend %>% 
+  distinct(loan_status)
+```
+
+```{r}
+lend %>% 
+  distinct(emp_length)
+```
+
+```{r}
+lend %>% 
+  distinct(purpose)
+```
+
+```{r}
+lend %>% 
+  distinct(home_ownership)
+```
+
+```{r}
+lend %>% 
+  ggplot(aes(x = loan_status)) + 
+  geom_bar() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Loan Status # of Occurences")
+```
+
+```{r}
+table(lend$loan_status)
+```
+
+
+Since we are only interested about response variable being a 2 level factor, we are filtering rows that are not "Charged Off" or "Fully Paid"
+
+```{r}
+lend <- lend %>% 
+  filter(loan_status == "Charged Off" | loan_status == "Fully Paid")
+```
+
+Reducing the number of categories in emp_length
+
+```{r}
+lend %>% 
+  distinct(emp_length)
+```
+
+
+```{r}
+lend$emp_length[lend$emp_length == "< 1 year" | lend$emp_length == "1 year" | lend$emp_length == "2 years" | lend$emp_length == "3 years"] <- "0-3 years"
+lend$emp_length[lend$emp_length == "4 years" | lend$emp_length == "5 years" | lend$emp_length == "6 years" | lend$emp_length == "7 years"] <- "4-7 years"
+lend$emp_length[lend$emp_length == "8 years" | lend$emp_length == "9 years" | lend$emp_length == "10+ years"] <- "8+ years"
+```
+
+
+## Plotting the histogram of the distribution of the numeric variables
+
+```{r}
+select_if(lend, is.numeric) %>% 
+  head()
+```
+
+```{r}
+ggplot(lend, aes(x = annual_inc, fill = loan_status)) +
+  geom_histogram(bins = 100) +
+  labs(title = "Loan Status by Annual Income", x = "Annual Income", y = "Count")
+```
+
+```{r}
+ggplot(lend, aes(x = loan_amnt, fill = loan_status)) +
+  geom_histogram(bins = 30) +
+  labs(title = "Loan Status by Loan Amount", x= "Loan Amount", y = "Count")
+```
+
+```{r}
+ggplot(lend, aes(x = fico_range_high, fill = loan_status)) +
+  geom_histogram(bins = 30) +
+  labs(title = "Loan Status by Fico High Range", x = "Fico Range High", y = "Count")
+```
+
+```{r}
+ggplot(lend, aes(x = total_acc, fill = loan_status)) +
+  geom_bar() +
+  labs(title = "Loan Status by Total # of Historical Credit Lines", x= "# of Historical Credit Lines", y = "Count")
+```
+
+```{r}
+ggplot(lend, aes(x = inq_last_6mths, fill = loan_status)) +
+  geom_bar() +
+  labs(title = "Loan Status by # of Inquiries in the Last 6 Months", x = "# of Inquiries in the Last 6 Months",  y = "Count")
+```
+
+```{r}
+ggplot(lend, aes(x = int_rate, fill = loan_status)) +
+  geom_histogram(bins = 30) +
+  labs(title = "Loan Status by Interest Rate", x = "Interest Rate", y = "Count")
+```
+
+```{r}
+ggplot(lend, aes(x = tot_cur_bal/1000, fill = loan_status)) +
+  geom_histogram(bins = 70) +
+  labs(title = "Loan Status by Total Current Balance of all Accounts (in thousands)", x = "Total Current Balance of all Accounts (in thousands)", y = "Count")
+```
+
+## Changing the Vatiables to the correct data types
+```{r}
+head(lend)
+```
+
+```{r}
+lend$verification_status <- as.factor(lend$verification_status)
+lend$loan_status <- as.factor(lend$loan_status)
+lend$grade <- as.factor(lend$grade)
+lend$emp_length <- as.factor(lend$emp_length)
+lend$home_ownership <- as.factor(lend$home_ownership)
+lend$purpose <- as.factor(lend$purpose)
+```
+
+
+## Creating a training and testing set
+
+```{r}
+lend_parts <- lend %>% 
+  initial_split(prop = 0.75)
+
+train <- lend_parts %>% 
+  training()
+
+test <- lend_parts %>% 
+  testing
+
+list(train, test) %>% 
+  map_int(nrow)
+```
+### Null Model 
+
+```{r}
+lend_null <- logistic_reg(mode = "classification") %>% 
+  set_engine("glm") %>% 
+  fit(loan_status ~ ., data = train)
+```
+
+```{r}
+pred <- train %>% 
+  dplyr::select(annual_inc, loan_amnt, verification_status, fico_range_high, grade, total_acc, loan_status, inq_last_6mths, emp_length, home_ownership, purpose, int_rate, tot_cur_bal) %>% 
+  bind_cols(
+    predict(lend_null, new_data = train, type = "class")
+  ) %>% 
+  rename(loan_null = .pred_class)
+```
+
+### kNN
+
+```{r}
+lend_knn <- nearest_neighbor(neighbors = 15) %>% 
+  set_engine("kknn", scale = TRUE) %>% 
+  set_mode("classification") %>% 
+  fit(loan_status ~ ., data = train)
+```
+
+```{r}
+lend_knn %>% 
+  predict(test) %>% 
+  bind_cols(test) %>% 
+  metrics(truth = loan_status, estimate = .pred_class)
+```
+
+```{r}
+lend_knn %>% 
+  predict(test) %>% 
+  bind_cols(test) %>% 
+  conf_mat(truth = loan_status, estimate = .pred_class)
+```
+
+```{r}
+lend_knn %>% 
+  predict(test, type = "prob") %>% 
+  bind_cols(test) %>% 
+  roc_curve(loan_status, `.pred_Charged Off`) %>% 
+  autoplot()
+```
+
+
+### Random Forest
+
+```{r}
+lend_rf <- rand_forest(trees = 100) %>% 
+  set_engine("ranger") %>% 
+  set_mode("classification") %>% 
+  fit(loan_status ~ ., data = train)
+```
+
+```{r}
+lend_rf %>% 
+  predict(test) %>% 
+  bind_cols(test) %>% 
+  metrics(truth = loan_status, estimate = .pred_class)
+```
+
+```{r}
+lend_rf %>% 
+  predict(test) %>% 
+  bind_cols(test) %>% 
+  conf_mat(truth = loan_status, estimate = .pred_class)
+```
+
+```{r}
+lend_rf %>% 
+  predict(test, type = "prob") %>% 
+  bind_cols(test) %>% 
+  roc_curve(loan_status, `.pred_Charged Off`) %>% 
+  autoplot()
+```
+
+
+### Naive Bayes
+
+```{r}
+lend_nb <- naive_Bayes(Laplace = 1) %>% 
+  set_engine("klaR") %>% 
+  set_mode("classification") %>% 
+  fit(loan_status ~ ., data = train)
+```
+
+```{r}
+suppressWarnings({lend_nb %>% 
+  predict(test) %>% 
+  bind_cols(test) %>% 
+  metrics(truth = loan_status, estimate = .pred_class)}) 
+```
+
+```{r}
+suppressWarnings({lend_nb %>% 
+  predict(test) %>% 
+  bind_cols(test) %>% 
+  conf_mat(truth = loan_status, estimate = .pred_class)}) 
+```
+
+```{r}
+suppressWarnings({lend_nb %>% 
+    predict(test, type = "prob") %>% 
+    bind_cols(test)} %>% 
+      roc_curve(loan_status, `.pred_Charged Off`)) %>% 
+  autoplot()
+```
+
+
+### GLM using Regularlization
+
+```{r}
+lend_glm <- logistic_reg(penalty = .00001, mixture = 0.1) %>% 
+  set_engine("glmnet") %>% 
+  set_mode("classification") %>% 
+  fit(loan_status ~ ., data = train)
+```
+
+```{r}
+lend_glm %>% 
+  predict(test) %>% 
+  bind_cols(test) %>% 
+  metrics(truth = loan_status, estimate = .pred_class)
+```
+
+```{r}
+lend_glm %>% 
+  predict(test) %>% 
+  bind_cols(test) %>% 
+  conf_mat(truth = loan_status, estimate = .pred_class)
+```
+
+```{r}
+lend_glm %>% 
+  predict(test, type = "prob") %>% 
+  bind_cols(test) %>% 
+  roc_curve(loan_status, `.pred_Charged Off`) %>% 
+  autoplot()
+```
+
+
+### XGBoost
+
+```{r}
+lend_xgb <- boost_tree(trees = 55) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification") %>% 
+  fit(loan_status ~ ., data = train)
+
+```
+
+```{r}
+lend_xgb %>% 
+  predict(test) %>% 
+  bind_cols(test) %>% 
+  metrics(truth = loan_status, estimate = .pred_class)
+```
+
+```{r}
+lend_xgb %>% 
+  predict(test) %>% 
+  bind_cols(test) %>% 
+  conf_mat(truth = loan_status, estimate = .pred_class)
+```
+
+
+```{r}
+lend_xgb %>% 
+  predict(test, type = "prob") %>% 
+  bind_cols(test) %>% 
+  roc_curve(loan_status, `.pred_Charged Off`) %>% 
+  autoplot()
+```
+
+
+### C5.0 
+```{r}
+lend_c50 <- boost_tree(trees = 55) %>% 
+  set_engine("C5.0") %>% 
+  set_mode("classification") %>% 
+  fit(loan_status ~ ., data = train)
+```
+
+```{r}
+lend_c50 %>% 
+  predict(test) %>% 
+  bind_cols(test) %>% 
+  metrics(truth = loan_status, estimate = .pred_class)
+```
+
+```{r}
+lend_c50 %>% 
+  predict(test) %>% 
+  bind_cols(test) %>% 
+  conf_mat(truth = loan_status, estimate = .pred_class)
+```
+
+
+
+### Decision Tree 
+
+```{r}
+lend_dtree <- decision_tree() %>% 
+  set_engine("rpart", control = rpart.control(cp = 0.003)) %>% 
+  set_mode("classification") %>% 
+  fit(loan_status ~ ., data = train)
+
+lend_dtree
+```
+
+```{r}
+lend_dtree %>% 
+  predict(test) %>% 
+  bind_cols(test) %>% 
+  metrics(truth = loan_status, estimate = .pred_class)
+```
+
+```{r}
+plot(as.party(lend_dtree$fit))
+```
+
+
+```{r}
+lend_dtree %>% 
+  predict(test) %>% 
+  bind_cols(test) %>% 
+  conf_mat(truth = loan_status, estimate = .pred_class)
+```
+
+
+```{r}
+lend_dtree %>% 
+  predict(test, type = "prob") %>% 
+  bind_cols(test) %>% 
+  roc_curve(loan_status, `.pred_Charged Off`) 
+```
+
+# Building the model with the Subsampled Dataset
+
+
+As we have observed in the distribution plot of loan_status above, we are dealing with a highly imbalanced dataset. There are only 1415 observed rows of Charged Off and 7230 observed rows of Fully Paid. The predictions we have developed are biased. We are going to create a new dataset using the ROSE and caret package to have an equal number of both occurences to see if it contributes to a better prediction model. Although the data is still overfitted, the percentage of Charged Off has gotten better and will give our model better training data. 
+
+```{r}
+over_lend <- ovun.sample(loan_status ~ ., data = train, method = "over", N=9000)$data
+head(over_lend)
+```
+
+```{r}
+table(over_lend$loan_status)
+```
+
+```{r}
+over_lend_parts <- over_lend %>% 
+  initial_split(prop = 0.8)
+
+train2 <- over_lend_parts %>% 
+  training()
+
+test2 <- over_lend_parts %>% 
+  testing()
+```
+
+
+### Null Model
+```{r}
+lend_null2 <- logistic_reg(mode = "classification") %>% 
+  set_engine("glm") %>% 
+  fit(loan_status ~  1., data = train2)
+```
+
+
+```{r}
+lend_null2 %>% 
+  predict(test2) %>% 
+  bind_cols(test2) %>% 
+  metrics(truth = loan_status, estimate = .pred_class)
+```
+
+### kNN
+
+```{r}
+lend_knn2 <- nearest_neighbor(neighbors = 25) %>% 
+  set_engine("kknn", scale = TRUE) %>% 
+  set_mode("classification") %>% 
+  fit(loan_status ~ ., data = train2)
+```
+
+```{r}
+lend_knn2 %>% 
+  predict(test2) %>% 
+  bind_cols(test2) %>% 
+  metrics(truth = loan_status, estimate = .pred_class)
+```
+
+```{r}
+lend_knn2 %>% 
+  predict(test2) %>% 
+  bind_cols(test2) %>% 
+  conf_mat(truth = loan_status, estimate = .pred_class)
+```
+
+```{r}
+lend_knn2 %>% 
+  predict(test2, type = "prob") %>% 
+  bind_cols(test2) %>% 
+  roc_curve(loan_status, `.pred_Charged Off`) %>% 
+  autoplot()
+```
+
+
+
+### Random Forest
+
+```{r}
+lend_rf2 <- rand_forest(trees = 100) %>% 
+  set_engine("ranger") %>% 
+  set_mode("classification") %>% 
+  fit(loan_status ~ ., data = train2)
+```
+
+```{r}
+lend_rf2 %>% 
+  predict(test2) %>% 
+  bind_cols(test2) %>% 
+  metrics(truth = loan_status, estimate = .pred_class)
+```
+
+```{r}
+lend_rf2 %>% 
+  predict(test2) %>% 
+  bind_cols(test2) %>% 
+  conf_mat(truth = loan_status, estimate = .pred_class)
+```
+
+```{r}
+lend_rf2 %>% 
+  predict(test2, type = "prob") %>% 
+  bind_cols(test2) %>% 
+  roc_curve(loan_status, `.pred_Fully Paid`) %>% 
+  autoplot()
+```
+
+
+### Naive Bayes
+
+```{r}
+lend_nb2 <- naive_Bayes(Laplace = 1) %>% 
+  set_engine("klaR") %>% 
+  set_mode("classification") %>% 
+  fit(loan_status ~ ., data = train2)
+```
+
+```{r}
+suppressWarnings({lend_nb2 %>% 
+  predict(test2) %>% 
+  bind_cols(test2) %>% 
+  metrics(truth = loan_status, estimate = .pred_class)}) 
+```
+
+```{r}
+suppressWarnings({lend_nb2 %>% 
+  predict(test2) %>% 
+  bind_cols(test2) %>% 
+  conf_mat(truth = loan_status, estimate = .pred_class)}) 
+```
+
+```{r}
+suppressWarnings({lend_nb2 %>% 
+  predict(test2, type = "prob") %>% 
+  bind_cols(test2) %>% 
+  roc_curve(loan_status, `.pred_Fully Paid`) %>% 
+    autoplot()}) 
+```
+
+
+### GLM using Regularlization
+
+```{r}
+lend_glm2 <- logistic_reg(penalty = .00001, mixture = 0.1) %>% 
+  set_engine("glmnet") %>% 
+  set_mode("classification") %>% 
+  fit(loan_status ~ ., data = train2)
+```
+
+```{r}
+lend_glm2 %>% 
+  predict(test2) %>% 
+  bind_cols(test2) %>% 
+  metrics(truth = loan_status, estimate = .pred_class)
+```
+
+```{r}
+lend_glm2 %>% 
+  predict(test2) %>% 
+  bind_cols(test2) %>% 
+  conf_mat(truth = loan_status, estimate = .pred_class)
+```
+
+```{r}
+lend_glm2 %>% 
+  predict(test2, type = "prob") %>% 
+  bind_cols(test2) %>% 
+  roc_curve(loan_status, `.pred_Fully Paid`) %>%
+  autoplot()
+```
+
+
+### XGBoost
+
+```{r}
+lend_xgb2 <- boost_tree(trees = 55) %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification") %>% 
+  fit(loan_status ~ ., data = train2)
+
+```
+
+```{r}
+lend_xgb2 %>% 
+  predict(test2) %>% 
+  bind_cols(test2) %>% 
+  metrics(truth = loan_status, estimate = .pred_class)
+```
+
+```{r}
+lend_xgb2 %>% 
+  predict(test2) %>% 
+  bind_cols(test2) %>% 
+  conf_mat(truth = loan_status, estimate = .pred_class)
+```
+
+```{r}
+lend_xgb2 %>% 
+  predict(test2, type = "prob") %>% 
+  bind_cols(test2) %>% 
+  roc_curve(loan_status, `.pred_Fully Paid`) %>% 
+  autoplot()
+```
+
+
+
+### C5.0 
+```{r}
+lend_c502 <- boost_tree(trees = 55) %>% 
+  set_engine("C5.0") %>% 
+  set_mode("classification") %>% 
+  fit(loan_status ~ ., data = train2)
+```
+
+```{r}
+lend_c502 %>% 
+  predict(test2) %>% 
+  bind_cols(test2) %>% 
+  metrics(truth = loan_status, estimate = .pred_class)
+```
+
+```{r}
+lend_c502 %>% 
+  predict(test2) %>% 
+  bind_cols(test2) %>% 
+  conf_mat(truth = loan_status, estimate = .pred_class)
+```
+
+### Decision Tree 
+
+```{r}
+lend_dtree2 <- decision_tree() %>% 
+  set_engine("rpart", control = rpart.control(cp = 0.003)) %>% 
+  set_mode("classification") %>% 
+  fit(loan_status ~ ., data = train2)
+
+lend_dtree
+```
+
+```{r}
+lend_dtree2 %>% 
+  predict(test2) %>% 
+  bind_cols(test2) %>% 
+  metrics(truth = loan_status, estimate = .pred_class)
+```
+
+
+```{r}
+lend_dtree2 %>% 
+  predict(test2) %>% 
+  bind_cols(test2) %>% 
+  conf_mat(truth = loan_status, estimate = .pred_class)
+```
+
+With the resampled data set, our best model is the C5.0 Decision Tree with a 93.11% accuracy. This model has the least false positive and false negative ratio out of all of the algorithms.
+
+
+## Tuning the Model 
+
+```{r}
+m_c50_bst <- C5.0(loan_status ~ ., data = train2, trials = 100)
+```
+
+```{r}
+pred <- predict(m_c50_bst, test2)
+confusionMatrix(data=pred, test2$loan_status)
+```
+
+## Conclusion
+
+We have determined that that the C5.0 decision tree model provided the most accurate predictions out of the other machine learning algorithms. Initially our dataset had a problem with an imbalance with more loans that were fully paid versus loans that were charged off. We then used caret to offset the imbalance, not perfectly balanced, but better than our initial data. With the model tuned, we have an accuracy of 94.44%! If the model were to be done differently, instead of using a condensed dataset, the full one should be used and should be compared to see if the same algorithm would be chosen. We can also try experimenting with other withheld variables as well. 
+
